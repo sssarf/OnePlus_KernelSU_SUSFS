@@ -3,42 +3,40 @@ permissions:
   contents: write  # Allow writing to repository contents (for pushing tags)
   actions: write   # Allows triggering actions
 
-on:
-  workflow_call: # This allows this workflow to be called from another workflow
-    inputs:
-      model:
-        required: true
-        type: string
-      soc:
-        required: true
-        type: string
-      branch:
-        required: true
-        type: string
-      manifest:
-        required: true
-        type: string
-      android_version:
-        required: true
-        type: string
-      kernel_version:
-        required: true
-        type: string
-      ksun_branch:
-        required: true
-        type: string
-        default: stable
-      susfs_branch:
-        required: true
-        type: string
-        default: ""
 
-jobs:
-  build-kernel-oneplus-kernelsu-susfs:
-    runs-on: ubuntu-latest
+inputs:
+  model:
+    required: true
+    type: string
+  soc:
+    required: true
+    type: string
+  branch:
+    required: true
+    type: string
+  manifest:
+    required: true
+    type: string
+  android_version:
+    required: true
+    type: string
+  kernel_version:
+    required: true
+    type: string
+  ksun_branch:
+    required: true
+    type: string
+    default: stable
+  susfs_branch:
+    required: true
+    type: string
+    default: ""
 
+runs:
+    using: "composite"
     steps:
       - name: Setup Build System
+        shell: bash
         run: |
           export DEBIAN_FRONTEND=noninteractive
           echo "DEBIAN_FRONTEND=noninteractive" >> $GITHUB_ENV
@@ -85,6 +83,7 @@ jobs:
           echo "CONFIG=${{ inputs.model }}" >> $GITHUB_ENV
 
       - name: Clone AnyKernel3 and Other Dependencies
+        shell: bash
         run: |
           echo "Cloning AnyKernel3 and other dependencies..."
           
@@ -101,10 +100,23 @@ jobs:
           
           # Clone repositories using the branch names
           git clone https://github.com/TheWildJames/AnyKernel3.git -b "$ANYKERNEL_BRANCH"
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_BRANCH"
           git clone https://github.com/TheWildJames/kernel_patches.git
+          
+          # Clone the repo with all branches and history (can optimize later if needed)
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git
+          cd susfs4ksu || exit 1
+          
+          # Try to check if TARGET_REF is a valid branch or tag
+          if git rev-parse --verify "origin/$SUSFS_BRANCH" >/dev/null 2>&1 || git rev-parse --verify "$SUSFS_BRANCH" >/dev/null 2>&1 ; then
+            # It's a branch or commit hash
+            git checkout "$SUSFS_BRANCH"
+          else
+            echo "Error: '$TARGET_REF' is neither a valid branch/tag nor a valid commit hash."
+            exit 1
+          fi
 
       - name: Initialize and Sync Kernel Source
+        shell: bash
         run: |
           echo "Creating folder for configuration: $CONFIG..."
           mkdir -p "$CONFIG"
@@ -119,6 +131,7 @@ jobs:
           $REPO --trace sync -c --no-clone-bundle --no-tags --optimized-fetch -j$(nproc --all) --fail-fast
       
       - name: Add KernelSU Next
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG/kernel_platform"
@@ -130,8 +143,11 @@ jobs:
           else
             curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s ${{ inputs.ksun_branch }}
           fi
+          
+          git submodule update --init --recursive
 
       - name: Apply SUSFS Patches
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG/kernel_platform"
@@ -149,7 +165,10 @@ jobs:
           susfs_version=$(grep '#define SUSFS_VERSION' ../common/include/linux/susfs.h | awk -F'"' '{print $2}')
           echo "SUSVER=$susfs_version" >> $GITHUB_ENV
           BASE_VERSION=10200
-          KSU_VERSION=$(expr $(curl -sI -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/commits?sha=${{ inputs.ksun_branch }}&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" $BASE_VERSION)
+          cd ./kernel
+          KSU_VERSION=$(expr $(/usr/bin/git rev-list --count HEAD) "+" $BASE_VERSION)
+          sed -i "s/DKSU_VERSION=11998/DKSU_VERSION=${KSU_VERSION}/" Makefile
+          cd ..
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
           echo "KernelSU Next Version: $KSU_VERSION"
           echo "SusFS Version: $susfs_version"
@@ -159,7 +178,32 @@ jobs:
               cp "../../../kernel_patches/next/0001-kernel-implement-susfs-v1.5.5-v1.5.7-KSUN-v1.0.8.patch" "./ksun_susfs_latest.patch"
               ;;
             "v1.5.8")
-              cp "../../../kernel_patches/next/0001-kernel-implement-susfs-v1.5.8-KernelSU-Next-v1.0.8.patch" "./ksun_susfs_latest.patch"
+              cp ../../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
+              patch -p1 --forward --fuzz=3 < 10_enable_susfs_for_ksu.patch  || true
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_apk_sign.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_apk_sign.c.patch
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_core_hook.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_core_hook.c.patch
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_selinux.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_selinux.c.patch
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_ksud.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_ksud.c.patch
+              ;;
+            "v1.5.9")
+              cp ../../../susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./
+              patch -p1 --forward --fuzz=3 < 10_enable_susfs_for_ksu.patch  || true
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_apk_sign.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_apk_sign.c.patch
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_core_hook.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_core_hook.c.patch
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_selinux.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_selinux.c.patch
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_ksud.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_ksud.c.patch
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_rules.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_rules.c.patch
+              cp "../../../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_sucompat.c.patch" ./
+              patch -p1 --forward --fuzz=3 < fix_sucompat.c.patch
               ;;
             *)
               echo "Invalid version: $susfs_version"
@@ -171,6 +215,11 @@ jobs:
           
           # Change to common directory and apply SUSFS patch
           cd ../common
+          
+          # SusFS Experimental Patches
+          echo "Patching susfs_dentry_null_checks!"
+          patch -p1 -F 3 < "../../../kernel_patches/experimental/susfs/susfs_dentry_checks.patch"
+          
           if [ "${{ inputs.android_version }}" = "android15" ] && [ "${{ inputs.kernel_version }}" = "6.6" ]; then
               if ! grep -qxF '#include <trace/hooks/fs.h>' ./fs/namespace.c; then
                   sed -i '/#include <trace\/hooks\/blk.h>/a #include <trace\/hooks\/fs.h>' ./fs/namespace.c
@@ -180,23 +229,30 @@ jobs:
           fi
           patch -p1 < 50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch || true
           
-          if ! grep -qxF '#define CMD_SUSFS_HIDE_SUS_MNTS_FOR_ALL_PROCS 0x55561' ./include/linux/susfs_def.h; then
-              curl -Ls https://raw.githubusercontent.com/fatalcoder524/kernel_patches_additional/refs/heads/main/hide_sus_mnts_for_all_procs.patch  | patch -p1 -F 3
-          else
-              echo "Line already present. Skipping SUSFS_HIDE_SUS_MNTS_FOR_ALL_PROCS Patch."
-          fi
-          
           KERNEL_VERSION="${{ inputs.kernel_version }}"
           MIN_VERSION="5.16"
           
           if [ "$(printf '%s\n' "$KERNEL_VERSION" "$MIN_VERSION" | sort -V | head -n1)" = "$KERNEL_VERSION" ]; then
             echo "Patching ptrace!"
-            curl -Ls https://raw.githubusercontent.com/fatalcoder524/kernel_patches_additional/refs/heads/main/ptrace.patch  | patch -p1 -F 3
+            patch -p1 -F 3 < "../../../kernel_patches/gki_ptrace.patch"
           else
             echo "Kernel >= $MIN_VERSION, skipping ptrace patch"
           fi
+          
+          if [ "${{ inputs.model }}" == "OPAce5Pro" ] || [ "${{ inputs.model }}" == "OP13" ]; then
+            echo "Patching hmbird!"
+            echo 'obj-y += hmbird_patch.o' >> ./drivers/Makefile
+            patch -p1 -F 3 < "../../../kernel_patches/oneplus/hmbird/hmbird_kernel_patch.patch"
+            echo "Patching hmbird files!"
+            cd ./kernel/sched
+            rm -rf ext.c ext.h build_policy.c slim.h slim_sysctl.c
+            patch -p1 -F 3 < "../../../../../kernel_patches/oneplus/hmbird/hmbird_files_patch.patch"
+          else
+            echo "Not OPAce5Pro / OP13 , skipping fengchi patch"
+          fi
 
       - name: Apply KSUN Hooks
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG/kernel_platform/common"
@@ -205,6 +261,7 @@ jobs:
           patch -p1 --fuzz=3 < ./manual_hooks.patch
           
       - name: Apply Hide Stuff Patches
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG/kernel_platform/common"
@@ -213,6 +270,7 @@ jobs:
           patch -p1 -F 3 < 69_hide_stuff.patch
 
       - name: Add KernelSU-Next and SUSFS Configuration Settings
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG/kernel_platform"
@@ -246,6 +304,7 @@ jobs:
           echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
 
       - name: Add BBR Support
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG/kernel_platform"
@@ -261,6 +320,7 @@ jobs:
           echo "CONFIG_NET_SCH_FQ_CODEL=y" >> ./common/arch/arm64/configs/gki_defconfig
 
       - name: Add TTL Target Support
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG/kernel_platform"
@@ -271,6 +331,7 @@ jobs:
           echo "CONFIG_IP6_NF_MATCH_HL=y" >> ./common/arch/arm64/configs/gki_defconfig
 
       - name: Run sed and perl Commands
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG/kernel_platform"
@@ -309,6 +370,7 @@ jobs:
           perl -pi -e 's{UTS_VERSION="\$\(echo \$UTS_VERSION \$CONFIG_FLAGS \$TIMESTAMP \| cut -b -\$UTS_LEN\)"}{UTS_VERSION="#1 SMP PREEMPT $DATESTR"}' ./msm-kernel/scripts/mkcompile_h
 
       - name: Build the Kernel
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG"
@@ -350,6 +412,7 @@ jobs:
           fi
 
       - name: Create ZIP Files for Different Formats
+        shell: bash
         run: |
           echo "Changing to configuration directory: $CONFIG..."
           cd "$CONFIG"
@@ -359,6 +422,11 @@ jobs:
           
           echo "Navigating to AnyKernel3 directory..."
           cd ../AnyKernel3
+          
+           if [ "${{ inputs.model }}" == "OPAce5Pro" ] || [ "${{ inputs.model }}" == "OP13" ]; then
+            cp ../kernel_patches/oneplus/hmbird/bins/* ./tools/
+            patch -F 3 < ../kernel_patches/oneplus/hmbird/ak3_hmbird_patch.patch
+          fi
           
           # Zip the files in the AnyKernel3 directory with a new naming convention
           ZIP_NAME="AnyKernel3_${{ inputs.model }}_${{ inputs.android_version }}-${{ inputs.kernel_version }}_Next_${{ env.KSUVER }}_SUSFS_${{ env.SUSVER }}.zip"
